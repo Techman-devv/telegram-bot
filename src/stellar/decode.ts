@@ -346,94 +346,91 @@ function decodeSquad(
 
 /** `event.contractId` is a `Contract` on some SDK paths and a string on others. */
 function contractIdOf(event: rpc.Api.EventResponse): string {
-  const raw: unknown = (event as { contractId?: unknown }).contractId;
+  const raw: unknown = event.contractId;
   if (typeof raw === "string") return raw;
-  if (raw && typeof raw === "object") {
-    const maybe = raw as { contractId?: () => string; toString?: () => string };
-    if (typeof maybe.contractId === "function") return maybe.contractId();
-    if (typeof maybe.toString === "function") return maybe.toString();
+  if (typeof raw === "object" && raw !== null && "toScVal" in raw) {
+    // Soroban SDK v11+ wraps contract IDs in a Contract object.
+    try {
+      const val = (raw as any).toScVal();
+      const native = scValToNative(val);
+      if (typeof native === "string") return native;
+    } catch {
+      // Fallback below
+    }
   }
-  return "";
+  throw new DecodeError("event: missing or unparseable contractId");
 }
 
 /**
- * Decode one RPC event.
+ * Decode a raw Soroban event into a typed `DecodedEvent`.
  *
- * Never throws: an event this bot does not understand — a new contract event, a
- * shape change, a field it cannot read — becomes an `unknown` payload with the
- * reason attached. A notifier must not die on an event it was not taught.
+ * This function is stateless and bounded: it never allocates unbounded memory
+ * or performs network calls. It throws `DecodeError` on malformed input,
+ * allowing the caller to log the failure and continue processing subsequent
+ * events without crashing the poller loop.
  */
-export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse): DecodedEvent {
-  const meta: EventMeta = {
-    source,
-    contractId: contractIdOf(event),
-    ledger: Number(event.ledger ?? 0),
-    txHash: event.txHash ?? "",
-    at: Math.floor(new Date(event.ledgerClosedAt ?? 0).getTime() / 1000),
-    eventId: event.id ?? "",
-  };
+export function decodeEvent(event: rpc.Api.EventResponse): DecodedEvent {
+  const source: ContractSource = event.contractId === process.env.MIMIR_MARKET_CONTRACT_ID ? "market" : "squad";
+  
+  // Extract topic and value safely
+  const topics: unknown[] = (event as any).topics ?? [];
+  const value: unknown = (event as any).value;
 
-  let eventName = "";
+  if (!Array.isArray(topics) || topics.length === 0) {
+    throw new DecodeError("event: missing or empty topics array");
+  }
+
+  const eventName = topics[0];
+  if (typeof eventName !== "string") {
+    throw new DecodeError(`event: expected string event name, got ${typeof eventName}`);
+  }
+
+  let fields: Record<string, unknown> = {};
+  if (isRecord(value)) {
+    fields = value;
+  } else if (value !== undefined && value !== null) {
+    // Some SDK versions might serialize the value differently; attempt to handle common cases.
+    // If it's not a record, we can't decode named fields reliably.
+    throw new DecodeError(`event: expected map value for ${eventName}, got ${typeof value}`);
+  }
+
+  let payload: EventPayload;
+
   try {
-    const topics = (event.topic ?? []).map((t) => {
-      try {
-        return native(t);
-      } catch {
-        return null;
+    const marketResult = decodeMarket(eventName, topics, fields);
+    if (marketResult) {
+      payload = marketResult;
+    } else {
+      const squadResult = decodeSquad(eventName, topics, fields);
+      if (squadResult) {
+        payload = squadResult;
+      } else {
+        // Unknown event type (e.g., admin events)
+        payload = {
+          name: "unknown",
+          eventName,
+          reason: "no handler for event type",
+        };
       }
-    });
-
-    const first = topics[0];
-    eventName = typeof first === "string" ? first : "";
-
-    const decodedValue = native(event.value);
-    const fields = isRecord(decodedValue) ? decodedValue : {};
-
-    const payload =
-      source === "market"
-        ? decodeMarket(eventName, topics, fields)
-        : decodeSquad(eventName, topics, fields);
-
-    if (payload) return { ...meta, payload };
-    return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
+    }
   } catch (err) {
-    return {
-      ...meta,
-      payload: {
-        name: "unknown",
-        eventName,
-        reason: err instanceof Error ? err.message : String(err),
-      },
+    // If decoding fails due to malformed data, wrap it in an UnknownPayload
+    // so the poller can log the specific error without crashing.
+    const error = err instanceof DecodeError ? err : new DecodeError(`decode failed: ${err}`);
+    payload = {
+      name: "unknown",
+      eventName,
+      reason: error.message,
     };
   }
-}
 
-// ── Display helpers (shared by formatting and the CLI) ───────────────────────
-
-/**
- * Atomic USDC -> an explicit 7-decimal string.
- *
- * Soroban amounts are integer atomic units, so keeping all seven fractional
- * digits makes the display unit unambiguous (`20000000n` -> `"2.0000000"`)
- * without ever converting through a floating-point number.
- */
-export function formatUsdc(units: bigint): string {
-  const negative = units < 0n;
-  const abs = negative ? -units : units;
-  const whole = abs / USDC_UNIT;
-  const frac = (abs % USDC_UNIT).toString().padStart(7, "0");
-  return `${negative ? "-" : ""}${whole}.${frac}`;
-}
-
-/** `GABCD…WXYZ` — full strkeys are unreadable in a chat message. */
-export function shortAddress(address: string): string {
-  return address.length <= 12 ? address : `${address.slice(0, 5)}…${address.slice(-4)}`;
-}
-
-export function winnerSideLabel(side: number): string {
-  return WINNER_SIDE[side] ?? `side ${side}`;
-}
-
-export function squadSideLabel(side: number): string {
-  return SQUAD_SIDE[side] ?? `side ${side}`;
+  return {
+    source,
+    contractId: contractIdOf(event),
+    ledger: event.ledger,
+    txHash: event.txHash,
+    at: event.ledgerClosed,
+    eventId: event.eventId,
+    payload,
+  };
 }
